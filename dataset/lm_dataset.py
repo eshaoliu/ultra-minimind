@@ -3,6 +3,7 @@ import torch
 import json
 import os
 import random
+import re
 from datasets import load_dataset, Features, Sequence, Value
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -222,6 +223,106 @@ class RLAIFDataset(Dataset):
             'prompt': prompt,
             'answer': ""
         }
+
+
+class RLVRDataset(Dataset):
+    """可验证奖励数据集：prompt 之外还带标准答案(answer)，供规则奖励函数判分。
+
+    数据格式（每行一条，加载时自动识别并过滤）：
+    - {"conversations": [...], "answer": "18"}                       —— answer 字段直接可用
+    - {"conversations": [..., {"role": "assistant", "content": "...#### 18"}]}
+      —— 末轮 assistant 含终答标记（#### / 答案： / answer:），提取后末轮不进入 prompt
+    - {"question": ..., "answer": "...#### 18"}                      —— 转为单轮对话
+    无法提取标准答案的行在加载时被跳过（无训练信号）。
+    """
+
+    GOLD_PATTERNS = [
+        r'####\s*\$?\s*(-?[\d,]+(?:\.\d+)?)',
+        r'答案[是为]?\s*[:：]?\s*\$?\s*(-?[\d,]+(?:\.\d+)?)',
+        r'(?i)answer\s*[:=]\s*\$?\s*(-?[\d,]+(?:\.\d+)?)',
+    ]
+    PLAIN_NUM_RE = re.compile(r'^-?[\d,]+(?:\.\d+)?$')
+
+    def __init__(self, jsonl_path, tokenizer, max_length=1024, thinking_ratio=0.5):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.thinking_ratio = thinking_ratio
+        raw = load_dataset('json', data_files=jsonl_path, split='train')
+        # 预扫描：提取标准答案，仅保留可验证样本
+        self.samples, self.golds = [], []
+        n_skip = 0
+        for sample in raw:
+            gold, convs = self._parse(sample)
+            if gold is None:
+                n_skip += 1
+                continue
+            self.samples.append(convs)
+            self.golds.append(gold)
+        if n_skip:
+            print(f'[RLVRDataset] 跳过无标准答案样本 {n_skip} 条，保留 {len(self.samples)} 条')
+
+    def __len__(self):
+        return len(self.samples)
+
+    @classmethod
+    def _normalize_num(cls, s):
+        return s.replace(',', '').rstrip('.') if s else None
+
+    @classmethod
+    def _extract_gold(cls, text):
+        if not text:
+            return None
+        for pat in cls.GOLD_PATTERNS:
+            m = re.findall(pat, text)
+            if m:
+                return cls._normalize_num(m[-1])
+        return None
+
+    @classmethod
+    def _parse(cls, sample):
+        """返回 (gold, conversations)；无法验证返回 (None, None)。"""
+        if 'conversations' in sample:
+            convs = sample['conversations']
+            ans = sample.get('answer')
+            if ans is not None:
+                gold = cls._normalize_num(str(ans).strip()) if cls.PLAIN_NUM_RE.match(str(ans).strip()) \
+                    else cls._extract_gold(str(ans))
+                if gold is not None:
+                    return gold, convs
+            if convs and convs[-1].get('role') == 'assistant':
+                gold = cls._extract_gold(convs[-1].get('content', ''))
+                if gold is not None:
+                    return gold, convs
+            return None, None
+        if 'question' in sample and 'answer' in sample:
+            gold = cls._extract_gold(sample['answer'])
+            if gold is None:
+                return None, None
+            convs = [{'role': 'user', 'content': sample['question'].strip()}]
+            return gold, convs
+        return None, None
+
+    def create_chat_prompt(self, conversations):
+        conversations = pre_processing_chat(conversations)
+        if conversations and conversations[-1]['role'] == 'assistant':
+            conversations = conversations[:-1]
+        use_thinking = random.random() < self.thinking_ratio
+        return self.tokenizer.apply_chat_template(
+            conversations,
+            tokenize=False,
+            open_thinking=use_thinking,
+            add_generation_prompt=True
+        )
+
+    def __getitem__(self, index):
+        prompt = self.create_chat_prompt(self.samples[index])
+
+        return {
+            'prompt': prompt,
+            'answer': self.golds[index]
+        }
+
 
 class AgentRLDataset(Dataset):
     def __init__(self, jsonl_path, tokenizer, max_length=1024):
