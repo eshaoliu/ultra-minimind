@@ -60,11 +60,13 @@ def setup_seed(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoch=0, step=0, wandb=None, save_dir='../checkpoints', **kwargs):
+def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoch=0, step=0, wandb=None, save_dir='../checkpoints', resume_dir=None, **kwargs):
     os.makedirs(save_dir, exist_ok=True)
     moe_path = '_moe' if lm_config.use_moe else ''
     ckp_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}.pth'
-    resume_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}_resume.pth'
+    resume_dir = resume_dir or save_dir
+    os.makedirs(resume_dir, exist_ok=True)
+    resume_path = f'{resume_dir}/{weight}_{lm_config.hidden_size}{moe_path}_resume.pth'
 
     if model is not None:
         raw_model = model.module if isinstance(model, DistributedDataParallel) else model
@@ -76,11 +78,8 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         os.replace(ckp_tmp, ckp_path)
         wandb_id = None
         if wandb:
-            if hasattr(wandb, 'get_run'):
-                run = wandb.get_run()
-                wandb_id = getattr(run, 'id', None) if run else None
-            else:
-                wandb_id = getattr(wandb, 'id', None)
+            run = getattr(wandb, 'run', None) or (wandb.get_run() if hasattr(wandb, 'get_run') else None)
+            wandb_id = getattr(run, 'id', None) if run else None
 
         resume_data = {
             'model': state_dict,
@@ -100,6 +99,10 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
                     resume_data[key] = value
 
         resume_tmp = resume_path + '.tmp'
+        # 完整 resume 体积大（1B约11GB），先删旧文件腾出空间；写入期间崩溃会丢 resume，
+        # 但权重 ckp 已先行保存，可退化为 --from_weight 续训
+        if os.path.exists(resume_path):
+            os.remove(resume_path)
         torch.save(resume_data, resume_tmp)
         os.replace(resume_tmp, resume_path)
         del state_dict, resume_data
@@ -116,8 +119,9 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         return None
 
 
-def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda'):
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda', tokenizer=None):
+    if tokenizer is None:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     model = MiniMindForCausalLM(lm_config)
 
     if from_weight!= 'none':
