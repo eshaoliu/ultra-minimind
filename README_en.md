@@ -323,6 +323,67 @@ cd trainer && python train_pretrain.py
 
 > After training, `out/pretrain_*.pth` will be produced as output weights (where `*` is the model dimension, default `768`)
 
+<details>
+<summary>🔥 Large-scale English pretraining in practice: Nemotron-CC-Math-v1 + 1B model (recommended advanced reading)</summary>
+
+Besides the default lightweight Chinese pretraining, this repo ships a complete **English math-corpus pretraining pipeline** for a `hidden=1536 x 32-layer` model (~`994M` params), fully implemented in the current codebase.
+
+**📚 Training Data**
+
+[Nemotron-CC-Math-v1](https://huggingface.co/datasets/nvidia/Nemotron-CC-Math-v1) (NVIDIA's open math corpus from Common Crawl, with finemath quality scores and dedup). Three quality tiers are provided:
+
+| Tier | Size | Notes |
+|---|---|---|
+| `3/` | 56.05M docs | quality score ≥3 |
+| **`4plus/`** | **45.10M docs (~46B tokens, 46 parquet shards)** | **highest-quality, decontaminated math slice; used by the main run** |
+| `4plus_MIND/` | 88.73M docs | re-processed expansion of 4plus, same source — **do not mix** |
+
+No need to load the corpus into memory: the streaming dataset (`PretrainStreamDataset` in `dataset/lm_dataset.py`) reads parquet shards sequentially, tokenizes on the fly with a `ThreadPoolExecutor` (fast tokenizer releases the GIL, ~550k tok/s measured), and trains while reading — memory footprint is independent of corpus size.
+
+**🔤 English Tokenizer**
+
+`model/tokenizer_en/`: 32k-vocab byte-level BPE trained on the above corpus via `scripts/build_en_tokenizer.py`, shipped with the repo. Special tokens align with the chat template: `<|endoftext|>`=0 (pad), `<|im_start|>`=1 (bos), `<|im_end|>`=2 (eos), plus reserved `<think>`/`<tool_call>` etc. (3-8, trained during later SFT).
+
+**🧠 Model Architecture** (1B config)
+
+`hidden_size=1536`, `32` layers, `GQA` (8 query heads / 4 KV heads, head_dim=192), RoPE (θ=1e6, up to 32k), input embedding and lm_head are **weight-tied** at vocab 32k — `~994M` params total.
+
+**⚡ Optimization Techniques** (all implemented in `train_pretrain.py`, auto-enabled when dependencies are detected)
+
+1. **Sequence Packing**: the data pipeline packs multiple documents into fixed `2048`-token blocks (`[bos]+tokens+[eos]` concatenated) with **zero padding** — every token is trained on, maximizing GPU utilization;
+2. **Varlen Attention (flash-attn varlen)** — the correct partner of packing. `flash_attn_varlen_func` isolates causal attention per document via `cu_seqlens` (documents never attend across boundaries), with RoPE positions reset to 0 inside each document; boundaries are auto-derived from bos positions in the packed block, no data-format change needed. Wrapped as a `torch.library` custom op, fully compatible with `torch.compile`;
+3. **WSD Learning Rate Schedule** (`--lr_scheduler wsd`): 1% linear warmup → stable phase → cosine decay to `0.1x` over the last 20%, computed deterministically from the step count and seamlessly resumed;
+4. **fused AdamW** (`fused=True`): the entire optimizer step fuses into a single CUDA kernel, cutting optimizer-state memory traffic from ~10 passes to ~2;
+5. **bf16 autocast + TF32**: mixed-precision training with TF32 matmuls;
+6. **Gradient Checkpointing** (`--gradient_checkpointing 1`): ~30% recompute overhead in exchange for much lower activation memory, enabling 1B training on a single 48G card;
+7. **torch.compile** (`--use_compile 1`): whole-graph compilation;
+8. **Rolling Checkpoints**: the full resume file (model + optimizer + scaler + step + SwanLab run_id) keeps only the latest copy; step-numbered weight snapshots (`w_step{N}.pth`) keep the most recent 3, so intermediate checkpoints can always be rolled back for evaluation;
+9. **SwanLab Monitoring** (`--use_wandb`, swanlab by default): real-time loss/logits_loss/ppl/learning_rate/tok_per_s; run_id is persisted in the resume file, so **resuming continues the same run without breaking the curve**.
+
+**🚀 Reproduction Command** (single L40 measured at a steady ~10,200 tok/s, effective MFU ~32%)
+
+```bash
+cd trainer && SWANLAB_API_KEY=<your_key> PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python train_pretrain.py \
+  --hidden_size 1536 --num_hidden_layers 32 --gradient_checkpointing 1 \
+  --max_seq_len 2048 --batch_size 16 --accumulation_steps 8 \
+  --epochs 1 --use_compile 1 --lr_scheduler wsd --use_wandb \
+  --tokenizer_path ../model/tokenizer_en \
+  --from_resume 1 --resume_dir /root/checkpoints_1b
+```
+
+> Micro-batch `16 x 2048` with gradient accumulation `8` = `262k` tokens per optimizer step. Full 4plus (~46B tokens) takes ~55 days on one card; peak memory ~28G/48G (params + optimizer + KV cache).
+
+**📊 Base-Model Evaluation (GSM8K)**
+
+```bash
+python scripts/eval_gsm8k_pretrain.py --weight out/pretrain_1536.pth
+```
+
+4-shot plain-text-completion eval on GSM8K test (1319 problems) — a practical way to track math capability throughout pretraining. At step 13k (0.9% of the corpus) the base model scores ~1.7%, a normal starting point; under this protocol capability is mostly unleashed by the SFT stage, and the pretraining eval serves to observe the relative trend.
+
+</details>
+
 #### 2.2 Instruction Fine-tuning (Required)
 
 ```bash

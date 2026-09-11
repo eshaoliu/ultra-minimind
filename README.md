@@ -324,6 +324,67 @@ cd trainer && python train_pretrain.py
 
 > 训练后，将得到 `out/pretrain_*.pth` 作为输出权重（其中 `*` 为模型 dimension，默认为 `768`）
 
+<details>
+<summary>🔥 大规模英文预训练实战：Nemotron-CC-Math-v1 + 1B 模型（推荐进阶阅读）</summary>
+
+本仓库除默认的轻量中文预训练外，还包含一条**英文数学语料大规模预训练**的完整生产线（`hidden=1536 x 32层`，约 `9.9 亿`参数），已在本仓库代码中全部实现。
+
+**📚 训练数据**
+
+使用 NVIDIA 开源的 [Nemotron-CC-Math-v1](https://huggingface.co/datasets/nvidia/Nemotron-CC-Math-v1)（Common Crawl 数学精华语料，含 finemath 质量分与去重）。仓库目录提供三个质量档位：
+
+| 切片 | 规模 | 说明 |
+|---|---|---|
+| `3/` | 5605 万篇 | 质量分 ≥3 |
+| **`4plus/`** | **4510 万篇（~460 亿 tokens，46 个 parquet shard）** | **最高质量、已去污的数学精华切片，主线训练使用** |
+| `4plus_MIND/` | 8873 万篇 | 4plus 的再加工扩展版，与 4plus 同源，**勿混训** |
+
+数据无需一次性加载：流式数据集（`dataset/lm_dataset.py` 的 `PretrainStreamDataset`）按 shard 编号顺序逐片读取 parquet，`ThreadPoolExecutor` 多线程即时分词（fast tokenizer 释放 GIL，实测 ~55 万 tok/s），边读边训，内存占用与语料规模无关。
+
+**🔤 英文分词器**
+
+`model/tokenizer_en/`：3.2 万词表 byte-level BPE，由 `scripts/build_en_tokenizer.py` 在上述语料上训练，已随仓库分发。特殊 token 与对话模板对齐：`<|endoftext|>`=0（pad）、`<|im_start|>`=1（bos）、`<|im_end|>`=2（eos），并预留 `<think>`/`<tool_call>` 等（3-8，供后续 SFT 阶段训练）。
+
+**🧠 模型结构**（1B 配置）
+
+`hidden_size=1536`，`32` 层，`GQA`（8 query heads / 4 KV heads，head_dim=192），RoPE（θ=1e6，最大外推 32k），词表 32k 时输入 embedding 与 lm_head **权重共享（tied）**，合计约 `994M` 参数。
+
+**⚡ 优化技巧**（全部已在 `train_pretrain.py` 实现，检测到依赖后自动启用）
+
+1. **Sequence Packing**：数据侧在线把多篇文档拼成 `2048` 定长块（`[bos]+tokens+[eos]` 无缝拼接），**零 padding**，每一个 token 都参与训练，GPU 算力利用率拉满；
+2. **变长 Attention（flash-attn varlen）**：packing 的正确搭档。`flash_attn_varlen_func` 按 `cu_seqlens` 文档边界隔离因果注意力（文档间互不 attend），RoPE 位置每篇文档内重置为 0；文档边界由 packing 块内的 bos 位置自动推导，无需改动数据格式。包装为 `torch.library` custom op，兼容 `torch.compile` 全图编译；
+3. **WSD 学习率调度**（`--lr_scheduler wsd`）：1% 线性 warmup → 稳定期 → 最后 20% cosine 衰减至 `0.1x`，按 step 确定性计算，续训后自动衔接；
+4. **fused AdamW**（`fused=True`）：整个优化器 step 融合为单次 CUDA kernel，优化器状态读写流量从 ~10 趟降到 ~2 趟；
+5. **bf16 autocast + TF32**：混合精度训练，矩阵乘自动用 TF32；
+6. **梯度检查点**（`--gradient_checkpointing 1`）：以 ~30% 重算开销换取激活显存大幅下降，单卡 48G 可训 1B 模型；
+7. **torch.compile**（`--use_compile 1`）：全图编译加速；
+8. **滚动检查点体系**：完整 resume（模型+优化器+scaler+step+SwanLab run_id）只留最新 1 份；带 step 编号的权重快照（`w_step{N}.pth`）滚动保留最近 3 份，可随时回退评测中间产物；
+9. **SwanLab 监控**（`--use_wandb`，默认 swanlab）：实时上报 loss/logits_loss/ppl/learning_rate/tok_per_s，run_id 持久化在 resume 文件中，**续训自动续上同一 run，曲线不断线**。
+
+**🚀 复现命令（单卡 L40 实测稳态 ~10,200 tok/s，有效 MFU ~32%）**
+
+```bash
+cd trainer && SWANLAB_API_KEY=<your_key> PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python train_pretrain.py \
+  --hidden_size 1536 --num_hidden_layers 32 --gradient_checkpointing 1 \
+  --max_seq_len 2048 --batch_size 16 --accumulation_steps 8 \
+  --epochs 1 --use_compile 1 --lr_scheduler wsd --use_wandb \
+  --tokenizer_path ../model/tokenizer_en \
+  --from_resume 1 --resume_dir /root/checkpoints_1b
+```
+
+> micro-batch `16 x 2048`，梯度累积 `8`，即每个 optimizer step 消费 `26.2 万` tokens。全量 4plus（~460 亿 tokens）单卡约 55 天；语料/优化器/KV cache 峰值显存约 28G/48G。
+
+**📊 基座能力评测（GSM8K）**
+
+```bash
+python scripts/eval_gsm8k_pretrain.py --weight out/pretrain_1536.pth
+```
+
+4-shot 纯文本补全格式评测 GSM8K test（1319 题），适合跟踪预训练过程中数学能力的爬升。基座模型（step 1.3 万，总进度 0.9%）约 1.7%，属正常起点；该口径下能力主要由 SFT 阶段释放，预训练评测用于观察相对趋势。
+
+</details>
+
 #### 2.2 指令微调（必须）
 
 ```bash
