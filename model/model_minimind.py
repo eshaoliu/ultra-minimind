@@ -118,7 +118,8 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xq, xk = self.q_norm(xq), self.k_norm(xk)
         cos, sin = position_embeddings
-        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+        # cos: (L, hd) 常规路径；(B, L, hd) 带position_ids的逐行位置（左padding批量推理）
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin, unsqueeze_dim=2 if cos.dim() == 3 else 1)
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
@@ -128,8 +129,9 @@ class Attention(nn.Module):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
         else:
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
-            if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+            # 掩码值取-1e4而非-inf/-1e9：fp16下-1e9会溢出成-inf导致全掩码行softmax出NaN并污染整个batch
+            if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), -1e4, device=scores.device).triu(1)
+            if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e4
             output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
@@ -208,7 +210,7 @@ class MiniMindModel(nn.Module):
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
-    def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, **kwargs):
+    def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, position_ids=None, **kwargs):
         batch_size, seq_length = input_ids.shape
         if hasattr(past_key_values, 'layers'): past_key_values = None
         past_key_values = past_key_values or [None] * len(self.layers)
@@ -218,7 +220,10 @@ class MiniMindModel(nn.Module):
         if self.freqs_cos[0, 0] == 0:
             freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
             self.freqs_cos, self.freqs_sin = freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
-        position_embeddings = (self.freqs_cos[start_pos:start_pos + seq_length], self.freqs_sin[start_pos:start_pos + seq_length])
+        if position_ids is not None:  # (B, L) 逐行绝对位置，用于左padding批量生成
+            position_embeddings = (self.freqs_cos[position_ids], self.freqs_sin[position_ids])
+        else:
+            position_embeddings = (self.freqs_cos[start_pos:start_pos + seq_length], self.freqs_sin[start_pos:start_pos + seq_length])
         presents = []
         gc_enabled = self.config.gradient_checkpointing and self.training and not use_cache
         for layer, past_key_value in zip(self.layers, past_key_values):
@@ -269,11 +274,22 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)
         attention_mask = attention_mask.repeat(num_return_sequences, 1) if attention_mask is not None else None
         past_key_values = kwargs.pop("past_key_values", None)
+        position_ids = None
+        if attention_mask is not None:
+            # 右padding下各行长度的logits取在pad位上，且续写会接在pad之后导致位置错乱。
+            # 统一改为左padding，并用mask推导逐行绝对位置，使每行最后一个token始终是真实token
+            n_pad = (1 - attention_mask).sum(1, keepdim=True)
+            total = attention_mask.shape[1]
+            shift_idx = (torch.arange(total, device=input_ids.device).unsqueeze(0) - n_pad) % total
+            input_ids = input_ids.gather(1, shift_idx)
+            attention_mask = attention_mask.gather(1, shift_idx)
         finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
         if streamer: streamer.put(input_ids.cpu())
         for _ in range(max_new_tokens):
             past_len = past_key_values[0][0].shape[1] if past_key_values else 0
-            outputs = self.forward(input_ids[:, past_len:], attention_mask, past_key_values, use_cache=use_cache, **kwargs)
+            if attention_mask is not None:
+                position_ids = ((attention_mask.cumsum(-1) - 1).clamp(min=0))[:, past_len:]
+            outputs = self.forward(input_ids[:, past_len:], attention_mask, past_key_values, use_cache=use_cache, position_ids=position_ids, **kwargs)
             attention_mask = torch.cat([attention_mask, attention_mask.new_ones(attention_mask.shape[0], 1)], -1) if attention_mask is not None else None
             logits = outputs.logits[:, -1, :] / temperature
             if repetition_penalty != 1.0:
