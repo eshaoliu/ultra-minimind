@@ -5,6 +5,64 @@ from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 
+try:  # packing 变长attention：flash_attn_varlen_func，文档间注意力隔离
+    from flash_attn import flash_attn_varlen_func as _flash_attn_varlen
+except ImportError:
+    _flash_attn_varlen = None
+
+if _flash_attn_varlen is not None:
+    # 包装为custom op使torch.compile可 tracing（变长cu_seqlens走动态shape，fake impl直通）。
+    # 训练需要autograd公式：backward直接复用flash_attn自带的可微实现（dropout仅支持0.0）
+    @torch.library.custom_op("minimind::varlen_attention", mutates_args=())
+    def _varlen_attention_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                             cu_seqlens: torch.Tensor, max_seqlen: int, dropout_p: float) -> torch.Tensor:
+        return _flash_attn_varlen(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+                                  dropout_p=dropout_p, causal=True)
+
+    @_varlen_attention_op.register_fake
+    def _varlen_attention_fake(q, k, v, cu_seqlens, max_seqlen, dropout_p):
+        return torch.empty_like(q)
+
+    def _varlen_attention_setup(ctx, inputs, output):
+        q, k, v, cu_seqlens, max_seqlen, dropout_p = inputs
+        ctx.save_for_backward(q, k, v, cu_seqlens)
+        ctx.max_seqlen = max_seqlen
+        ctx.dropout_p = dropout_p
+
+    def _varlen_attention_backward(ctx, grad_output):
+        qq, kk, vv, cu = ctx.saved_tensors
+        if ctx.dropout_p != 0.0:
+            raise NotImplementedError("varlen_attention backward仅支持dropout_p=0.0")
+        with torch.enable_grad():
+            qq = qq.detach().requires_grad_()
+            kk = kk.detach().requires_grad_()
+            vv = vv.detach().requires_grad_()
+            out2 = _flash_attn_varlen(qq, kk, vv, cu, cu, ctx.max_seqlen, ctx.max_seqlen,
+                                      dropout_p=0.0, causal=True)
+            gq, gk, gv = torch.autograd.grad(out2, (qq, kk, vv), grad_output)
+        return gq, gk, gv, None, None, None
+
+    _varlen_attention_op.register_autograd(_varlen_attention_backward, setup_context=_varlen_attention_setup)
+
+
+def packing_varlen_info(input_ids, bos_token_id):
+    """由packing块内的bos位置推导文档边界，返回 (cu_seqlens, max_seqlen, position_ids)。
+
+    cu_seqlens: int32 (nseg+1,)，展平batch后的文档起始偏移；position_ids: (B, L) 文档内位置（每篇重置为0）。
+    """
+    bsz, seq_len = input_ids.shape
+    device = input_ids.device
+    is_start = input_ids.eq(bos_token_id)
+    idx = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+    seg_start = torch.cummax(is_start * (idx + 1), dim=1).values
+    position_ids = idx - (seg_start - 1)
+    starts = is_start.flatten().nonzero(as_tuple=True)[0].to(torch.int32)
+    starts = starts[starts > 0]  # 展平后第0个token必为块首bos，其偏移0由下面显式补上
+    total = torch.tensor(bsz * seq_len, dtype=torch.int32, device=device)
+    cu_seqlens = torch.cat([starts.new_zeros(1), starts, total.unsqueeze(0)])
+    max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+    return cu_seqlens, max_seqlen, position_ids
+
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 #                                     MiniMind Config
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
@@ -110,7 +168,8 @@ class Attention(nn.Module):
         self.dropout = config.dropout
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
 
-    def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+    def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None,
+                cu_seqlens=None, max_seqlen=None):
         bsz, seq_len, _ = x.shape
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
@@ -118,8 +177,16 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xq, xk = self.q_norm(xq), self.k_norm(xk)
         cos, sin = position_embeddings
-        # cos: (L, hd) 常规路径；(B, L, hd) 带position_ids的逐行位置（左padding批量推理）
+        # cos: (L, hd) 常规路径；(B, L, hd) 带position_ids的逐行位置（左padding批量推理/文档内位置）
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin, unsqueeze_dim=2 if cos.dim() == 3 else 1)
+        if cu_seqlens is not None:  # packing变长：整batch展平，flash_attn按文档隔离因果注意力
+            q = xq.reshape(bsz * seq_len, self.n_local_heads, self.head_dim)
+            k = xk.reshape(bsz * seq_len, self.n_local_kv_heads, self.head_dim)
+            v = xv.reshape(bsz * seq_len, self.n_local_kv_heads, self.head_dim)
+            output = torch.ops.minimind.varlen_attention(
+                q, k, v, cu_seqlens, max_seqlen, self.dropout if self.training else 0.0)
+            output = output.view(bsz, seq_len, -1)
+            return self.resid_dropout(self.o_proj(output)), None
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
@@ -187,11 +254,12 @@ class MiniMindBlock(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
-    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None,
+                cu_seqlens=None, max_seqlen=None):
         residual = hidden_states
         hidden_states, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states), position_embeddings,
-            past_key_value, use_cache, attention_mask
+            past_key_value, use_cache, attention_mask, cu_seqlens, max_seqlen
         )
         hidden_states += residual
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
@@ -220,10 +288,12 @@ class MiniMindModel(nn.Module):
         if self.freqs_cos[0, 0] == 0:
             freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
             self.freqs_cos, self.freqs_sin = freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
-        if position_ids is not None:  # (B, L) 逐行绝对位置，用于左padding批量生成
+        if position_ids is not None:  # (B, L) 逐行绝对位置，用于左padding批量生成/packing文档内位置
             position_embeddings = (self.freqs_cos[position_ids], self.freqs_sin[position_ids])
         else:
             position_embeddings = (self.freqs_cos[start_pos:start_pos + seq_length], self.freqs_sin[start_pos:start_pos + seq_length])
+        cu_seqlens = kwargs.get('cu_seqlens', None)
+        max_seqlen = kwargs.get('max_seqlen', None)
         presents = []
         gc_enabled = self.config.gradient_checkpointing and self.training and not use_cache
         for layer, past_key_value in zip(self.layers, past_key_values):
@@ -232,7 +302,8 @@ class MiniMindModel(nn.Module):
                 hidden_states, present = checkpoint(
                     layer, hidden_states, position_embeddings,
                     past_key_value=past_key_value, use_cache=use_cache,
-                    attention_mask=attention_mask, use_reentrant=False,
+                    attention_mask=attention_mask, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                    use_reentrant=False,
                 )
             else:
                 hidden_states, present = layer(
@@ -240,7 +311,9 @@ class MiniMindModel(nn.Module):
                     position_embeddings,
                     past_key_value=past_key_value,
                     use_cache=use_cache,
-                    attention_mask=attention_mask
+                    attention_mask=attention_mask,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
                 )
             presents.append(present)
         hidden_states = self.norm(hidden_states)

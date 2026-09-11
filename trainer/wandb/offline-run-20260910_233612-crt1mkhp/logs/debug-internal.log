@@ -1,0 +1,21 @@
+{"time":"2026-09-10T23:36:13.148008192+08:00","level":"INFO","msg":"wandb-core"}
+{"time":"2026-09-10T23:36:13.148025588+08:00","level":"INFO","msg":"stream: starting","core version":"0.30.0"}
+{"time":"2026-09-10T23:36:13.1837823+08:00","level":"INFO","msg":"stream: created new stream","id":"crt1mkhp"}
+{"time":"2026-09-10T23:36:13.183818923+08:00","level":"INFO","msg":"handler: started"}
+{"time":"2026-09-10T23:36:13.183857803+08:00","level":"INFO","msg":"stream: started"}
+{"time":"2026-09-10T23:36:13.183867735+08:00","level":"INFO","msg":"writer: started","stream_id":"crt1mkhp"}
+{"time":"2026-09-10T23:36:13.183881857+08:00","level":"INFO","msg":"sender: started"}
+{"time":"2026-09-10T23:36:13.190498183+08:00","level":"WARN","msg":"featurechecker: GraphQL client is nil, skipping feature loading"}
+{"time":"2026-09-10T23:36:13.190511746+08:00","level":"WARN","msg":"runupserter: server does not expand metric globs but the x_server_side_expand_glob_metrics setting is set; ignoring"}
+{"time":"2026-09-11T00:04:43.66668296+08:00","level":"ERROR","msg":"writer: failed to save record: transactionlog: error writing: write /root/gpufree-data/ultra-minimind/trainer/wandb/offline-run-20260910_233612-crt1mkhp/run-crt1mkhp.wandb: no space left on device"}
+{"time":"2026-09-11T00:04:43.666729423+08:00","level":"ERROR","msg":"writer: failed to save record: transactionlog: error starting next record: write /root/gpufree-data/ultra-minimind/trainer/wandb/offline-run-20260910_233612-crt1mkhp/run-crt1mkhp.wandb: no space left on device"}
+{"time":"2026-09-11T00:04:43.666737159+08:00","level":"ERROR","msg":"writer: failed to save record: transactionlog: error starting next record: write /root/gpufree-data/ultra-minimind/trainer/wandb/offline-run-20260910_233612-crt1mkhp/run-crt1mkhp.wandb: no space left on device"}
+{"time":"2026-09-11T00:04:43.666742892+08:00","level":"ERROR","msg":"writer: failed to save record: transactionlog: error starting next record: write /root/gpufree-data/ultra-minimind/trainer/wandb/offline-run-20260910_233612-crt1mkhp/run-crt1mkhp.wandb: no space left on device"}
+{"time":"2026-09-11T00:04:43.666747599+08:00","level":"ERROR","msg":"writer: failed to save record: transactionlog: error starting next record: write /root/gpufree-data/ultra-minimind/trainer/wandb/offline-run-20260910_233612-crt1mkhp/run-crt1mkhp.wandb: no space left on device"}
+{"time":"2026-09-11T00:04:43.666752071+08:00","level":"ERROR","msg":"writer: failed to save record: transactionlog: error starting next record: write /root/gpufree-data/ultra-minimind/trainer/wandb/offline-run-20260910_233612-crt1mkhp/run-crt1mkhp.wandb: no space left on device"}
+{"time":"2026-09-11T00:04:43.666756421+08:00","level":"ERROR","msg":"writer: failed to save record: transactionlog: error starting next record: write /root/gpufree-data/ultra-minimind/trainer/wandb/offline-run-20260910_233612-crt1mkhp/run-crt1mkhp.wandb: no space left on device"}
+{"time":"2026-09-11T00:04:43.666760572+08:00","level":"ERROR","msg":"writer: failed to save record: transactionlog: error starting next record: write /root/gpufree-data/ultra-minimind/trainer/wandb/offline-run-20260910_233612-crt1mkhp/run-crt1mkhp.wandb: no space left on device"}
+{"time":"2026-09-11T00:04:43.666765126+08:00","level":"ERROR","msg":"writer: failed to save record: transactionlog: error starting next record: write /root/gpufree-data/ultra-minimind/trainer/wandb/offline-run-20260910_233612-crt1mkhp/run-crt1mkhp.wandb: no space left on device"}
+{"time":"2026-09-11T00:04:43.666769341+08:00","level":"ERROR","msg":"writer: failed to save record: transactionlog: error starting next record: write /root/gpufree-data/ultra-minimind/trainer/wandb/offline-run-20260910_233612-crt1mkhp/run-crt1mkhp.wandb: no space left on device"}
+{"time":"2026-09-11T00:04:43.666773815+08:00","level":"ERROR","msg":"writer: failed to save record: transactionlog: error starting next record: write /root/gpufree-data/ultra-minimind/trainer/wandb/offline-run-20260910_233612-crt1mkhp/run-crt1mkhp.wandb: no space left on device"}
+{"time":"2026-09-11T00:04:43

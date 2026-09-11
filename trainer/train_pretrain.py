@@ -16,7 +16,7 @@ from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer
-from model.model_minimind import MiniMindConfig
+from model.model_minimind import MiniMindConfig, packing_varlen_info, _flash_attn_varlen
 from dataset.lm_dataset import PretrainDataset, PretrainStreamDataset, estimate_stream_iters
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
@@ -56,7 +56,12 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             param_group['lr'] = lr
 
         with autocast_ctx:
-            res = model(input_ids, labels=labels)
+            if args.use_varlen:  # packing变长attention：文档间隔离，文档内位置重置
+                cu_seqlens, max_seqlen, position_ids = packing_varlen_info(input_ids, args.bos_token_id)
+                res = model(input_ids, labels=labels, position_ids=position_ids,
+                            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+            else:
+                res = model(input_ids, labels=labels)
             loss = res.loss + res.aux_loss
             loss = loss / args.accumulation_steps
 
@@ -162,10 +167,14 @@ if __name__ == "__main__":
     os.makedirs(args.save_dir, exist_ok=True)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
     args.pad_token_id = tokenizer.pad_token_id
+    args.bos_token_id = tokenizer.bos_token_id
+    args.use_varlen = _flash_attn_varlen is not None  # packing变长attention，需flash-attn
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
                                use_moe=bool(args.use_moe), vocab_size=len(tokenizer),
                                bos_token_id=tokenizer.bos_token_id, eos_token_id=tokenizer.eos_token_id,
                                gradient_checkpointing=bool(args.gradient_checkpointing))
+    if args.use_varlen:
+        Logger('启用 packing 变长attention（flash_attn_varlen，文档间隔离）')
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints', resume_dir=args.resume_dir) if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
