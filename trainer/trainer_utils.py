@@ -82,8 +82,9 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         os.replace(ckp_tmp, ckp_path)
         wandb_id = None
         if wandb:
-            run = getattr(wandb, 'run', None) or (wandb.get_run() if hasattr(wandb, 'get_run') else None)
-            wandb_id = getattr(run, 'id', None) if run else None
+            # swanlab的init返回值即Run对象（有.id），wandb模块则用.run/.get_run()
+            run = getattr(wandb, 'run', None) or (wandb.get_run() if hasattr(wandb, 'get_run') else None) or wandb
+            wandb_id = getattr(run, 'id', None)
 
         resume_data = {
             'model': state_dict,
