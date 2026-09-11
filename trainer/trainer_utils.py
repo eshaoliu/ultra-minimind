@@ -2,7 +2,9 @@
 训练工具函数集合
 """
 import os
+import re
 import sys
+from glob import glob
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import random
@@ -66,7 +68,9 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
     ckp_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}.pth'
     resume_dir = resume_dir or save_dir
     os.makedirs(resume_dir, exist_ok=True)
-    resume_path = f'{resume_dir}/{weight}_{lm_config.hidden_size}{moe_path}_resume.pth'
+    # 完整 resume（含优化器状态，9.4G/份）磁盘放不下多份，只保留最新1份；
+    # 另存带step号的权重快照（2G/份）滚动保留最近3份，供回退 --from_weight 用
+    resume_path = f'{resume_dir}/{weight}_{lm_config.hidden_size}{moe_path}_resume_step{step}.pth'
 
     if model is not None:
         raw_model = model.module if isinstance(model, DistributedDataParallel) else model
@@ -98,16 +102,35 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
                 else:
                     resume_data[key] = value
 
+        # 权重快照（2G），滚动保留最近3份
+        snap_path = f'{resume_dir}/{weight}_{lm_config.hidden_size}{moe_path}_w_step{step}.pth'
+        snap_tmp = snap_path + '.tmp'
+        torch.save(state_dict, snap_tmp)
+        os.replace(snap_tmp, snap_path)
+        snaps = sorted(
+            glob(f'{resume_dir}/{weight}_{lm_config.hidden_size}{moe_path}_w_step*.pth'),
+            key=lambda p: int(re.search(r'_w_step(\d+)\.pth$', p).group(1)))
+        for old in snaps[:-3]:
+            os.remove(old)
+
+        # 完整 resume 体积大，写入前先删所有旧 resume 腾出空间；写入期间崩溃会丢 resume，
+        # 但权重快照和 ckp 已先行保存，可退化为 --from_weight 续训
+        for old in glob(f'{resume_dir}/{weight}_{lm_config.hidden_size}{moe_path}_resume*.pth'):
+            if old != resume_path:
+                os.remove(old)
         resume_tmp = resume_path + '.tmp'
-        # 完整 resume 体积大（1B约11GB），先删旧文件腾出空间；写入期间崩溃会丢 resume，
-        # 但权重 ckp 已先行保存，可退化为 --from_weight 续训
-        if os.path.exists(resume_path):
-            os.remove(resume_path)
         torch.save(resume_data, resume_tmp)
         os.replace(resume_tmp, resume_path)
         del state_dict, resume_data
         torch.cuda.empty_cache()
-    else:  # 加载模式
+    else:  # 加载模式：取 step 最大的 resume（兼容无 step 后缀的旧版文件）
+        candidates = glob(f'{resume_dir}/{weight}_{lm_config.hidden_size}{moe_path}_resume*.pth')
+        if not candidates:
+            return None
+        def _step_of(p):
+            m = re.search(r'_resume_step(\d+)\.pth$', p)
+            return int(m.group(1)) if m else -1
+        resume_path = max(candidates, key=_step_of)
         if os.path.exists(resume_path):
             ckp_data = torch.load(resume_path, map_location='cpu')
             saved_ws = ckp_data.get('world_size', 1)
